@@ -1,0 +1,253 @@
+# --------------------------------------
+# Author: Furqan Farooq
+# GitHub: https://github.com/furqanfarooq096
+# Huawei LTE Cell Power Calculator GUI App
+# --------------------------------------
+
+# ------------------------------
+# Imports
+# ------------------------------
+import pandas as pd
+import tkinter as tk
+from tkinter import filedialog, messagebox
+import os
+from tkinterdnd2 import DND_FILES, TkinterDnD
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
+
+# ------------------------------
+# Mapping Dictionaries
+# ------------------------------
+DL_BW_MAP = {
+    "CELL_BW_N25": 5, "CELL_BW_N50": 10,
+    "CELL_BW_N75": 15, "CELL_BW_N100": 20
+}
+
+PRB_MAP = {5: 25, 10: 50, 15: 75, 20: 100}
+
+TXRX_MAP = {
+    "1T1R": 1, "2T2R": 2, "4T4R": 4,
+    "8T8R": 8, "32T32R": "MM"
+}
+
+PB_RATIO_MAP = {
+    1: {0: 1, 1: 4/5, 2: 3/5, 3: 2/5},
+    2: {0: 5/4, 1: 1, 2: 3/4, 3: 1/2},
+    4: {0: 5/4, 1: 1, 2: 3/4, 3: 1/2},
+    8: {0: 5/4, 1: 1, 2: 3/4, 3: 1/2}
+}
+
+PA_VALUES = {
+    "DB_6_P_A": -6, "DB_4DOT77_P_A": -4.77, "DB_3_P_A": -3,
+    "DB_1DOT77_P_A": -1.77, "DB0_P_A": 0, "DB1_P_A": 1,
+    "DB2_P_A": 2, "DB3_P_A": 3
+}
+
+# ------------------------------
+# Utility Functions
+# ------------------------------
+def dbm_to_mw(dbm):
+    return 10 ** (dbm / 10)
+
+def parse_pa(pa_str):
+    return PA_VALUES.get(str(pa_str).strip(), 0)
+
+def get_pb_ratio(pb, ports):
+    try:
+        return PB_RATIO_MAP.get(int(ports), {}).get(int(pb), 1)
+    except:
+        return 1
+
+def calculate_power(rs_raw, prb, pa_db, pb_index, ports):
+    if ports == "MM":
+        return {"Rs Power (mW)": "MM", "PA Power (mW)": "MM", "PB Power (mW)": "MM", "Grid A Power (mW)": "MM",
+                "Grid B Power (mW)": "MM", "Total Power Per Port (W)": "MM", "Cell Power (W)": "MM"}
+
+    rs_dbm = rs_raw * 0.1
+    rs_mw = dbm_to_mw(rs_dbm)
+    pb_ratio = get_pb_ratio(pb_index, ports)
+    pa_added_dbm = rs_dbm + pa_db
+    pa_mw = dbm_to_mw(pa_added_dbm)
+    pb_mw = pa_mw * pb_ratio
+
+    grid_a_mw = rs_mw * 2 * prb + pb_mw * 8 * prb
+    grid_b_mw = pa_mw * 12 * prb
+
+    total_per_port_mw = max(grid_a_mw, grid_b_mw)
+    total_per_port_watt = total_per_port_mw / 1000
+    total_cell_power = total_per_port_watt * int(ports)
+
+    return {
+        "Rs Power (mW)": round(rs_mw, 2),
+        "PA Power (mW)": round(pa_mw, 2),
+        "PB Power (mW)": round(pb_mw, 2),
+        "Grid A Power (mW)": round(grid_a_mw, 2),
+        "Grid B Power (mW)": round(grid_b_mw, 2),
+        "Total Power Per Port (W)": round(total_per_port_watt, 2),
+        "Cell Power (W)": round(total_cell_power, 2)
+    }
+
+# ------------------------------
+# File Processing
+# ------------------------------
+def generate_unique_filename(base_path):
+    if not os.path.exists(base_path):
+        return base_path
+    base, ext = os.path.splitext(base_path)
+    i = 1
+    while True:
+        new_path = f"{base}_{i}{ext}"
+        if not os.path.exists(new_path):
+            return new_path
+        i += 1
+
+def process_files(paths):
+    try:
+        # File identification
+        pdsch_path = next(p for p in paths if "PDSCHCFG" in os.path.basename(p))
+        pa_path = next(p for p in paths if "CELLDLPCPDSCHPA" in os.path.basename(p))
+        cell_path = next(p for p in paths if "CELL" in os.path.basename(p))
+
+        def read_file(path):
+            return pd.read_excel(path) if path.endswith(('.xlsx', '.xls')) else pd.read_csv(path)
+
+        pdsch = read_file(pdsch_path)
+        pa = read_file(pa_path)
+        cell = read_file(cell_path)
+
+        for df in [pdsch, pa, cell]:
+            df.columns = df.columns.str.strip()
+
+        pdsch.rename(columns={"ReferenceSignalPwr": "RsPower", "Pb": "PB"}, inplace=True)
+        pa.rename(columns={"PaPcOff": "PA"}, inplace=True)
+
+        merged = pd.merge(pdsch, pa, on=["NeName", "CellName", "LocalCellId"], how="inner")
+        merged = pd.merge(merged, cell, on=["NeName", "CellName", "LocalCellId"], how="inner")
+
+        # Calculation
+        results = []
+        for idx, row in merged.iterrows():
+            try:
+                bw_label = str(row.get("DlBandWidth", "")).strip()
+                bw = DL_BW_MAP.get(bw_label)
+                if not bw:
+                    continue
+
+                prb = PRB_MAP.get(bw)
+                txrx = str(row.get("TxRxMode", "")).strip()
+                ports = TXRX_MAP.get(txrx)
+                if not ports:
+                    continue
+
+                rs_raw = float(row.get("RsPower", 0))
+                pb = int(row.get("PB", 0))
+                pa_val = parse_pa(row.get("PA", "DB0_P_A"))
+                pb_ratio = get_pb_ratio(pb, ports)
+
+                power_info = calculate_power(rs_raw, prb, pa_val, pb, ports)
+
+                results.append({
+                    "NeName": row["NeName"],
+                    "CellName": row["CellName"],
+                    "LocalCellId": row["LocalCellId"],
+                    "DlBandWidth (MHz)": bw,
+                    "PRB Number": prb,
+                    "TxRxMode": txrx,
+                    "Rs Power (dBm)": round(rs_raw * 0.1, 2),
+                    "PA (dB)": pa_val,
+                    "PB": pb,
+                    "PB Ratio": pb_ratio,
+                    **power_info,
+                    "Dynamic Power Per Port (W)": 0
+                })
+
+            except Exception:
+                continue
+
+        # Save and inject formulas
+        df_out = pd.DataFrame(results)
+        folder = filedialog.askdirectory(title="Select folder to save output Excel")
+        if not folder:
+            return
+
+        final_path = generate_unique_filename(os.path.join(folder, "CellPowerOutput.xlsx"))
+        df_out.to_excel(final_path, index=False)
+
+        wb = load_workbook(final_path)
+        ws = wb.active
+        headers = [cell.value for cell in ws[1]]
+        col_idx = {key: idx + 1 for idx, key in enumerate(headers)}
+        col_letter = {key: get_column_letter(idx) for key, idx in col_idx.items()}
+
+        for i, row in enumerate(df_out.itertuples(), start=2):
+            txrx = getattr(row, 'TxRxMode', "")
+            if txrx == "32T32R":
+                ws.cell(i, col_idx["Dynamic Power Per Port (W)"], value="MM")
+                continue
+
+            formula = f'''=IF({col_letter["TxRxMode"]}{i}="32T32R","MM",MAX(
+10^({col_letter["Rs Power (dBm)"]}{i}/10)*2*{col_letter["PRB Number"]}{i} +
+10^(({col_letter["Rs Power (dBm)"]}{i}+{col_letter["PA (dB)"]}{i})/10)*{col_letter["PB Ratio"]}{i}*8*{col_letter["PRB Number"]}{i},
+10^(({col_letter["Rs Power (dBm)"]}{i}+{col_letter["PA (dB)"]}{i})/10)*12*{col_letter["PRB Number"]}{i}
+)/1000)'''
+
+            ws.cell(i, col_idx["Dynamic Power Per Port (W)"]).value = formula
+
+        wb.save(final_path)
+        messagebox.showinfo("Success", f"Output saved:\n{final_path}")
+
+    except Exception as e:
+        messagebox.showerror("Error", str(e))
+
+# ------------------------------
+# GUI Setup
+# ------------------------------
+def manual_select():
+    messagebox.showinfo("Select", "Select PDSCHCFG file")
+    pdsch = filedialog.askopenfilename()
+    messagebox.showinfo("Select", "Select CELLDLPCPDSCHPA file")
+    pa = filedialog.askopenfilename()
+    messagebox.showinfo("Select", "Select CELL file")
+    cell = filedialog.askopenfilename()
+    if pdsch and pa and cell:
+        process_files([pdsch, pa, cell])
+
+def launch_gui():
+    root = TkinterDnD.Tk()
+    root.title("Huawei LTE Cell Power Calculator")
+    root.geometry("530x440")
+
+    try:
+        root.iconbitmap("celltower.ico")
+    except:
+        pass
+
+    font_title = ("Calibri", 15, "bold")
+    font_text = ("Calibri", 11)
+    font_arabic = ("Calibri", 13, "bold")
+
+    tk.Label(root, text="Huawei LTE Cell Power Calculator", font=font_title, pady=10).pack(pady=(15, 5))
+    tk.Label(root, text="Drop PDSCHCFG, CELLDLPCPDSCHPA, and CELL files\nor use the manual selection button.", font=font_text).pack(pady=(0, 10))
+
+    drop_area = tk.Label(root, text="⬇️ Drop Files Here ⬇️", font=("Calibri", 12), bg="#f0f0f0", relief="ridge", width=40, height=4)
+    drop_area.pack(pady=(5, 5))
+
+    def on_drop(event):
+        files = root.tk.splitlist(event.data)
+        process_files(files)
+
+    drop_area.drop_target_register(DND_FILES)
+    drop_area.dnd_bind("<<Drop>>", on_drop)
+
+    tk.Button(root, text="📂 Select Files Manually", font=font_text, command=manual_select).pack(pady=(5, 20))
+    tk.Label(root, text="رَبِّ زِدْنِي عِلْمًا", font=font_arabic, fg="green").pack(pady=(10, 2))
+    tk.Label(root, text="Author: Furqan Farooq", font=font_text).pack()
+    tk.Label(root, text="GitHub: github.com/furqanfarooq096", font=font_text, fg="blue").pack()
+
+    root.mainloop()
+
+# ------------------------------
+# Entry Point
+# ------------------------------
+if __name__ == "__main__":
+    launch_gui()
