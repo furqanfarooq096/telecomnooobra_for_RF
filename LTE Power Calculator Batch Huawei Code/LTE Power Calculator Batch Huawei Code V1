@@ -1,0 +1,209 @@
+import pandas as pd
+import tkinter as tk
+from tkinter import filedialog, messagebox
+import os
+import math
+from tkinterdnd2 import DND_FILES, TkinterDnD
+
+# --- Mappings ---
+DL_BW_MAP = {
+    "CELL_BW_N25": 5,
+    "CELL_BW_N50": 10,
+    "CELL_BW_N75": 15,
+    "CELL_BW_N100": 20
+}
+
+PRB_MAP = {
+    5: 25,
+    10: 50,
+    15: 75,
+    20: 100
+}
+
+TXRX_MAP = {
+    "1T1R": 1,
+    "2T2R": 2,
+    "4T4R": 4,
+    "8T8R": 8,
+    "32T32R": "MM"
+}
+
+PB_RATIO_MAP = {
+    1: {0: 1, 1: 4/5, 2: 3/5, 3: 2/5},
+    2: {0: 5/4, 1: 1, 2: 3/4, 3: 1/2},
+    4: {0: 5/4, 1: 1, 2: 3/4, 3: 1/2},
+    8: {0: 5/4, 1: 1, 2: 3/4, 3: 1/2}
+}
+
+PA_VALUES = {
+    "DB_6_P_A": -6,
+    "DB_4DOT77_P_A": -4.77,
+    "DB_3_P_A": -3,
+    "DB_1DOT77_P_A": -1.77,
+    "DB0_P_A": 0,
+    "DB1_P_A": 1,
+    "DB2_P_A": 2,
+    "DB3_P_A": 3
+}
+
+# --- Utility Functions ---
+def dbm_to_mw(dbm):
+    return 10 ** (dbm / 10)
+
+def parse_pa(pa_str):
+    return PA_VALUES.get(str(pa_str).strip(), 0)
+
+def get_pb_ratio(pb, ports):
+    try:
+        pb = int(pb)
+        ports = int(ports)
+        return PB_RATIO_MAP.get(ports, {}).get(pb, 1)
+    except:
+        return 1
+
+def calculate_power(rs_raw, prb, pa_db, pb_index, ports):
+    if ports == "MM":
+        return {
+            "Rs Power (mW)": "MM",
+            "PA Power (mW)": "MM",
+            "PB Power (mW)": "MM",
+            "Total EB Power (mW)": "MM",
+            "Total EA Power (mW)": "MM",
+            "Total Power Per Port (W)": "Proceed to MM Calculator",
+            "Cell Power (W)": "MM"
+        }
+
+    rs_dbm = rs_raw * 0.1
+    rs_mw = dbm_to_mw(rs_dbm)
+
+    pb_ratio = get_pb_ratio(pb_index, ports)
+    pa_added_dbm = rs_dbm + pa_db
+    pa_mw = dbm_to_mw(pa_added_dbm)
+    pb_mw = pa_mw * pb_ratio
+
+    grid_a_mw = rs_mw * 2 * prb + pb_mw * 8 * prb
+    grid_b_mw = pa_mw * 12 * prb
+
+    total_per_port_mw = max(grid_a_mw, grid_b_mw)
+    total_per_port_watt = total_per_port_mw / 1000
+    total_cell_power = total_per_port_watt * int(ports)
+
+    return {
+        "Rs Power (mW)": round(rs_mw, 2),
+        "PA Power (mW)": round(pa_mw, 2),
+        "PB Power (mW)": round(pb_mw, 2),
+        "Total EB Power (mW)": round(grid_a_mw, 2),
+        "Total EA Power (mW)": round(grid_b_mw, 2),
+        "Total Power Per Port (W)": round(total_per_port_watt, 2),
+        "Cell Power (W)": round(total_cell_power, 2)
+    }
+
+# --- File Processing ---
+def process_files(paths):
+    try:
+        pdsch_path = next(p for p in paths if "PDSCHCFG" in os.path.basename(p))
+        pa_path = next(p for p in paths if "CELLDLPCPDSCHPA" in os.path.basename(p))
+        cell_path = next(p for p in paths if "CELL" in os.path.basename(p))
+
+        pdsch = pd.read_excel(pdsch_path) if pdsch_path.endswith((".xlsx", ".xls")) else pd.read_csv(pdsch_path)
+        pa = pd.read_excel(pa_path) if pa_path.endswith((".xlsx", ".xls")) else pd.read_csv(pa_path)
+        cell = pd.read_excel(cell_path) if cell_path.endswith((".xlsx", ".xls")) else pd.read_csv(cell_path)
+
+        pdsch.rename(columns={"ReferenceSignalPwr": "RsPower", "Pb": "PB"}, inplace=True)
+        pa.rename(columns={"PaPcOff": "PA"}, inplace=True)
+
+        for df in [pdsch, pa, cell]:
+            df.columns = df.columns.str.strip()
+
+        merged = pd.merge(pdsch, pa, on=["NeName", "CellName", "LocalCellId"], how="inner")
+        merged = pd.merge(merged, cell, on=["NeName", "CellName", "LocalCellId"], how="inner")
+
+        results = []
+        for _, row in merged.iterrows():
+            bw_label = str(row["DlBandWidth"]).strip()
+            bw = DL_BW_MAP.get(bw_label)
+            prb = PRB_MAP.get(bw)
+            txrx = str(row["TxRxMode"]).strip()
+            ports = TXRX_MAP.get(txrx)
+
+            if not bw or not prb or not ports:
+                continue
+
+            rs_raw = float(row["RsPower"])
+            pb = int(row["PB"])
+            pa = parse_pa(row["PA"])
+
+            power_info = calculate_power(rs_raw, prb, pa, pb, ports)
+
+            results.append({
+                "NeName": row["NeName"],
+                "CellName": row["CellName"],
+                "LocalCellId": row["LocalCellId"],
+                "DlBandWidth (MHz)": bw,
+                "PRB Number": prb,
+                "TxRxMode": txrx,
+                "Rs Power (dBm)": round(rs_raw * 0.1, 2),
+                "PA (dB)": pa,
+                "PB": pb,
+                **power_info
+            })
+
+        df_out = pd.DataFrame(results)
+        folder = filedialog.askdirectory(title="Select folder to save output CSV")
+        if not folder:
+            return
+
+        output_path = os.path.join(folder, "CellPowerOutput.csv")
+        df_out.to_csv(output_path, index=False)
+        messagebox.showinfo("Success", f"Output saved:\n{output_path}")
+
+    except Exception as e:
+        messagebox.showerror("Error", str(e))
+
+# --- GUI & App ---
+def manual_select():
+    messagebox.showinfo("Select", "Select PDSCHCFG file")
+    pdsch = filedialog.askopenfilename()
+    messagebox.showinfo("Select", "Select CELLDLPCPDSCHPA file")
+    pa = filedialog.askopenfilename()
+    messagebox.showinfo("Select", "Select CELL file")
+    cell = filedialog.askopenfilename()
+    if pdsch and pa and cell:
+        process_files([pdsch, pa, cell])
+
+def launch_gui():
+    root = TkinterDnD.Tk()
+    root.title("Huawei LTE Cell Power Calculator")
+    root.geometry("530x440")
+
+    try:
+        root.iconbitmap("celltower.ico")
+    except:
+        pass
+
+    font_title = ("Calibri", 15, "bold")
+    font_text = ("Calibri", 11)
+    font_arabic = ("Calibri", 13, "bold")
+
+    tk.Label(root, text="Huawei LTE Cell Power Calculator", font=font_title, pady=10).pack(pady=(15, 5))
+    tk.Label(root, text="Drop PDSCHCFG, CELLDLPCPDSCHPA, and CELL files\nor use the manual selection button.", font=font_text).pack(pady=(0, 10))
+
+    drop_area = tk.Label(root, text="⬇️ Drop Files Here ⬇️", font=("Calibri", 12), bg="#f0f0f0", relief="ridge", width=40, height=4)
+    drop_area.pack(pady=(5, 5))
+
+    def on_drop(event):
+        files = root.tk.splitlist(event.data)
+        process_files(files)
+
+    drop_area.drop_target_register(DND_FILES)
+    drop_area.dnd_bind("<<Drop>>", on_drop)
+
+    tk.Button(root, text="📂 Select Files Manually", font=font_text, command=manual_select).pack(pady=(5, 20))
+    tk.Label(root, text="رَبِّ زِدْنِي عِلْمًا", font=font_arabic, fg="green").pack(pady=(10, 2))
+    tk.Label(root, text="Author: Furqan Farooq", font=font_text).pack()
+    tk.Label(root, text="GitHub: github.com/furqanfarooq096", font=font_text, fg="blue").pack()
+
+    root.mainloop()
+
+if __name__ == "__main__":
+    launch_gui()
